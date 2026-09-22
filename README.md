@@ -24,6 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/xamionex/slsconfigurator/main/insta
 Downloads the latest release and installs it to `~/.local/bin/slsconfigurator`.
 Make sure `~/.local/bin` is on your `PATH`.
 
+Run with just `slsconfigurator` after running the install oneliner.
+
 Releases are built by GitHub Actions on every `v*` tag with cargo-zigbuild against glibc 2.28, so the binary also runs on SteamOS.
 The release asset is named `slsconfigurator`.
 
