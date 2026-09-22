@@ -3,8 +3,7 @@
 #
 # Installs the latest release binary into ~/.local/bin.
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/xamionex/slsconfigurator/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/xamionex/slsconfigurator/main/install.sh | sh
 #
 # SLSCONFIGURATOR_URL overrides the download URL (testing, forks).
 set -eu

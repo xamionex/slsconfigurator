@@ -1,7 +1,10 @@
 //! SLSconfigurator - a TUI editor for SLSsteam's config.
 
+mod appinfo;
 mod config;
+mod picker;
 mod schema;
+mod steam;
 mod tui;
 
 use std::path::PathBuf;

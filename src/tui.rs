@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{self, check_entry, ConfigFile, Item, Node, TopLevel};
+use crate::picker::{self, Picker};
 use crate::schema::{self, Shape, ValueKind};
 
 /// A row of the settings list.
@@ -51,8 +52,26 @@ struct TextEdit {
 
 /// What a one line prompt is asking for.
 enum PromptKind {
-    AddKey { path: Vec<usize> },
-    AddValue { path: Vec<usize>, key: String },
+    AddKey {
+        path: Vec<usize>,
+    },
+    AddValue {
+        path: Vec<usize>,
+        key: String,
+    },
+    /// Quick add of an AppId, optionally with a name comment.
+    QuickAdd {
+        key: String,
+    },
+    /// Edit comment line `index` of a setting, or append when it is `None`.
+    Comment {
+        key: String,
+        index: Option<usize>,
+    },
+    /// Inline comment of a collection entry.
+    Trailing {
+        line: usize,
+    },
 }
 
 struct Prompt {
@@ -65,6 +84,7 @@ struct Prompt {
 enum Mode {
     List,
     Tree,
+    Comments,
 }
 
 struct App {
@@ -74,6 +94,11 @@ struct App {
     tree_selection: usize,
     /// Key of the collection open in the tree editor.
     tree_key: String,
+    /// Key whose comment block is open in the comment editor.
+    comments_key: String,
+    comment_selection: usize,
+    /// Steam search panel.
+    picker: Picker,
     edit: Option<TextEdit>,
     prompt: Option<Prompt>,
     confirm_quit: bool,
@@ -88,6 +113,9 @@ impl App {
             selection: 0,
             tree_selection: 0,
             tree_key: String::new(),
+            comments_key: String::new(),
+            comment_selection: 0,
+            picker: Picker::new(),
             edit: None,
             prompt: None,
             confirm_quit: false,
@@ -210,9 +238,17 @@ impl App {
             return Ok(false);
         }
 
+        if self.picker.has_focus() {
+            return match self.picker.handle_key(&mut self.file, key) {
+                picker::Outcome::Handled => Ok(false),
+                picker::Outcome::Pass(key) => self.handle_list(key),
+            };
+        }
+
         match self.mode {
             Mode::List => self.handle_list(key),
             Mode::Tree => self.handle_tree(key),
+            Mode::Comments => self.handle_comments(key),
         }
     }
 
@@ -231,11 +267,114 @@ impl App {
             KeyCode::Home => self.jump(true),
             KeyCode::End => self.jump(false),
             KeyCode::Char(' ') | KeyCode::Enter => self.open(),
+            KeyCode::Tab => self.open_comments(),
+            KeyCode::Char('g') => self.picker.toggle(),
+            KeyCode::Char('a') => self.quick_add(),
             _ => {}
         }
         Ok(false)
     }
 
+    /// The selected setting, when it is an AppId list.
+    fn list_key(&self) -> Option<String> {
+        let (key, shape) = self.selected_key()?;
+        (shape == Shape::Seq).then_some(key)
+    }
+
+    /// Quick add an AppId to the selected list, without opening the tree editor.
+    fn quick_add(&mut self) {
+        let Some(key) = self.list_key() else {
+            self.status =
+                "Quick add works on AppId lists (AppIds, AdditionalApps, ...)".to_string();
+            return;
+        };
+        if self.top_for(&key).is_none() {
+            self.status = format!("{key} is not in the config file yet");
+            return;
+        }
+        self.prompt = Some(Prompt {
+            title: format!("Add to {key} (AppId [name])"),
+            kind: PromptKind::QuickAdd { key },
+            buffer: String::new(),
+            cursor: 0,
+        });
+    }
+
+    /// Open the comment block of the selected setting.
+    fn open_comments(&mut self) {
+        let Some((key, _)) = self.selected_key() else {
+            return;
+        };
+        if self.top_for(&key).is_none() {
+            self.status = format!("{key} is not in the config file yet");
+            return;
+        }
+        self.comments_key = key.clone();
+        self.comment_selection = 0;
+        self.mode = Mode::Comments;
+        if self.file.comment_block(&key).is_empty() {
+            self.prompt = Some(Prompt {
+                title: format!("Comment for {key}"),
+                kind: PromptKind::Comment { key, index: None },
+                buffer: String::new(),
+                cursor: 0,
+            });
+        }
+    }
+
+    /// Keys while the comment block editor is open.
+    fn handle_comments(&mut self, key: KeyEvent) -> Result<bool, String> {
+        let lines = self.file.comment_block(&self.comments_key);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') | KeyCode::Tab => {
+                self.mode = Mode::List;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.comment_selection = self.comment_selection.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.comment_selection + 1 < lines.len() {
+                    self.comment_selection += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(text) = lines.get(self.comment_selection) {
+                    let key = self.comments_key.clone();
+                    let index = self.comment_selection;
+                    self.prompt = Some(Prompt {
+                        title: "Comment line".to_string(),
+                        kind: PromptKind::Comment {
+                            key,
+                            index: Some(index),
+                        },
+                        buffer: text.clone(),
+                        cursor: text.chars().count(),
+                    });
+                }
+            }
+            KeyCode::Char('a') => {
+                let key = self.comments_key.clone();
+                self.prompt = Some(Prompt {
+                    title: "New comment line".to_string(),
+                    kind: PromptKind::Comment { key, index: None },
+                    buffer: String::new(),
+                    cursor: 0,
+                });
+            }
+            KeyCode::Char('d') => {
+                self.file
+                    .remove_comment_line(&self.comments_key, self.comment_selection);
+                let len = self.file.comment_block(&self.comments_key).len();
+                self.comment_selection = self.comment_selection.min(len.saturating_sub(1));
+            }
+            KeyCode::Char('s') => self.save()?,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Keys while the collection editor is open.
     fn handle_tree(&mut self, key: KeyEvent) -> Result<bool, String> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => {
@@ -256,9 +395,29 @@ impl App {
             KeyCode::Char('a') => self.start_add(),
             KeyCode::Char('d') => self.delete_tree_row(),
             KeyCode::Char('s') => self.save()?,
+            KeyCode::Tab => self.edit_trailing_comment(),
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Edit (or add) the inline comment of the selected collection entry.
+    fn edit_trailing_comment(&mut self) {
+        let Some(row) = self.tree_selected() else {
+            return;
+        };
+        if matches!(row.node, Node::Seq { .. } | Node::Map { .. }) {
+            self.status = "Only entries with a value can carry a comment".to_string();
+            return;
+        }
+        let line = row.line();
+        let text = row.trailing.trim_start_matches('#').trim().to_string();
+        self.prompt = Some(Prompt {
+            title: format!("Comment for {}", row.label),
+            kind: PromptKind::Trailing { line },
+            cursor: text.chars().count(),
+            buffer: text,
+        });
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -613,6 +772,37 @@ impl App {
                     self.status = e;
                 }
             }
+            PromptKind::QuickAdd { key } => match ConfigFile::parse_add_entry(&text) {
+                Ok((appid, name)) => match self.file.add_item(&key, &[], None, &appid) {
+                    Ok(line) => {
+                        if let Some(name) = name {
+                            self.file.set_trailing_comment(line, &name);
+                        }
+                        self.status = format!("Added {appid} to {key}");
+                    }
+                    Err(e) => self.status = e,
+                },
+                Err(e) => self.status = e,
+            },
+            PromptKind::Comment { key, index } => {
+                let text = text.trim_end();
+                if text.is_empty() {
+                    if let Some(index) = index {
+                        self.file.remove_comment_line(&key, index);
+                    }
+                    self.status = format!("Comment cleared for {key}");
+                } else if let Some(index) = index {
+                    self.file.set_comment_line(&key, index, text);
+                    self.status = format!("Comment updated for {key}");
+                } else {
+                    self.file.insert_comment_line(&key, None, text);
+                    self.status = format!("Comment added to {key}");
+                }
+            }
+            PromptKind::Trailing { line } => {
+                self.file.set_trailing_comment(line, &text);
+                self.status = "Comment updated".to_string();
+            }
             PromptKind::AddValue { path, key } => {
                 let kind = schema::value_kind(&self.tree_key);
                 let shape = match self
@@ -678,9 +868,16 @@ impl App {
             .split(frame.area());
 
         self.render_header(frame, chunks[0]);
-        match self.mode {
-            Mode::List => self.render_list(frame, chunks[1]),
-            Mode::Tree => self.render_tree(frame, chunks[1]),
+        if self.picker.has_focus() {
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(40), Constraint::Length(52)])
+                .split(chunks[1]);
+            self.render_body(frame, body[0]);
+            let file = self.file.clone();
+            self.picker.render(&file, frame, body[1]);
+        } else {
+            self.render_body(frame, chunks[1]);
         }
         self.render_footer(frame, chunks[2]);
 
@@ -695,10 +892,48 @@ impl App {
         }
     }
 
+    fn render_body(&mut self, frame: &mut Frame, area: Rect) {
+        match self.mode {
+            Mode::List => self.render_list(frame, area),
+            Mode::Tree => self.render_tree(frame, area),
+            Mode::Comments => self.render_comments(frame, area),
+        }
+    }
+
+    /// The comment block above a setting, one line per row.
+    fn render_comments(&mut self, frame: &mut Frame, area: Rect) {
+        let lines = self.file.comment_block(&self.comments_key);
+        let items: Vec<ListItem> = if lines.is_empty() {
+            vec![ListItem::new(
+                Line::from("(no comment yet - press a to add one)").dim(),
+            )]
+        } else {
+            lines
+                .iter()
+                .map(|line| ListItem::new(Line::from(line.clone())))
+                .collect()
+        };
+
+        let mut state = ListState::default();
+        if !lines.is_empty() {
+            state.select(Some(self.comment_selection.min(lines.len() - 1)));
+        }
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Comment - {}", self.comments_key)),
+            )
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("> ");
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let title = match self.mode {
             Mode::List => "SLSsteam config",
             Mode::Tree => "SLSsteam config - editing a collection",
+            Mode::Comments => "SLSsteam config - editing a comment",
         };
         let modified = if self.file.dirty() { " (modified)" } else { "" };
         let text = Line::from(vec![
@@ -796,16 +1031,29 @@ impl App {
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let help = self.help_text();
         let keys = match self.mode {
-            Mode::List => "up/down select   enter toggle/edit   s save   q quit",
-            Mode::Tree => {
-                "up/down select   enter edit   space toggle   a add   d delete   esc back"
+            Mode::List if self.picker.has_focus() && self.picker.is_removing() => {
+                "type to filter   space remove   r back to search   t target   ctrl+s save"
             }
+            Mode::List if self.picker.has_focus() && self.picker.is_editing() => {
+                "keep typing to search   enter details   esc stop editing   ctrl+r remove games   ctrl+s save"
+            }
+            Mode::List if self.picker.has_focus() => {
+                "type to search   enter details   space toggle   r remove games   t target   esc close"
+            }
+            Mode::List => {
+                "up/down select   enter open   tab comment   g steam   a quick add   s save   q quit"
+            }
+            Mode::Tree => {
+                "up/down select   enter edit   space toggle   a add   d delete   tab comment   esc back"
+            }
+            Mode::Comments => "up/down select   enter edit   a add   d delete   esc back",
         };
-        let lines = vec![
-            Line::from(help),
-            Line::from(keys).dim(),
-            Line::from(self.status.clone()),
-        ];
+        let status = if self.picker.has_focus() && !self.picker.status().is_empty() {
+            self.picker.status().to_string()
+        } else {
+            self.status.clone()
+        };
+        let lines = vec![Line::from(help), Line::from(keys).dim(), Line::from(status)];
         frame.render_widget(
             Paragraph::new(lines)
                 .block(Block::default().borders(Borders::ALL))
@@ -816,11 +1064,25 @@ impl App {
 
     /// Help for the selection: the file's own comment when there is one, the built-in description otherwise.
     fn help_text(&self) -> String {
+        if matches!(self.mode, Mode::Comments) {
+            return format!(
+                "Comment above {} - shown as help text while the setting is selected",
+                self.comments_key
+            );
+        }
+        if self.picker.has_focus() {
+            return "Search Steam, then space-check the games, DLCs, packages and depots you want"
+                .to_string();
+        }
         if matches!(self.mode, Mode::Tree) {
             if let Some(setting) = schema::find(&self.tree_key) {
                 return setting.help.to_string();
             }
             return "Editing a collection".to_string();
+        }
+        if self.picker.has_focus() {
+            return "Search Steam, then space-check the games, DLCs, packages and depots you want"
+                .to_string();
         }
         let Some((key, _)) = self.selected_key() else {
             let (missing, unknown) = self.review_rows();
@@ -886,11 +1148,16 @@ impl App {
             terminal
                 .draw(|frame| self.render(frame))
                 .map_err(|e| e.to_string())?;
-            let event = event::read().map_err(|e| e.to_string())?;
-            if let Event::Key(key) = event {
-                if self.handle_key(key)? {
-                    return Ok(());
+            // Poll so the picker can search on its own while typing pauses.
+            if event::poll(std::time::Duration::from_millis(80)).map_err(|e| e.to_string())? {
+                let event = event::read().map_err(|e| e.to_string())?;
+                if let Event::Key(key) = event {
+                    if self.handle_key(key)? {
+                        return Ok(());
+                    }
                 }
+            } else {
+                self.picker.tick(&self.file);
             }
         }
     }
@@ -903,6 +1170,7 @@ impl App {
         match self.mode {
             Mode::List => "list",
             Mode::Tree => "tree",
+            Mode::Comments => "comments",
         }
     }
 }
@@ -1087,6 +1355,118 @@ LogLevels: 0xff
             app.selected_setting().unwrap().key,
             "DisableFamilyShareLock"
         );
+    }
+
+    /// Move the settings selection to `key`.
+    fn select(app: &mut App, key: &str) {
+        app.selection = app
+            .rows()
+            .iter()
+            .position(|row| match row {
+                Row::Setting(index) => schema::SETTINGS[*index].key == key,
+                Row::Other(other) => other == key,
+                Row::Section(_) => false,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn tab_edits_the_comment_above_a_key() {
+        let mut app = app();
+        select(&mut app, "DisableFamilyShareLock");
+        app.open_comments();
+        assert_eq!(app.mode_name(), "comments");
+        assert!(
+            app.prompt.is_none(),
+            "an existing comment is shown, not typed"
+        );
+
+        // a adds a line at the end of the block
+        app.handle_comments(KeyEvent::from(KeyCode::Char('a')))
+            .unwrap();
+        app.prompt.as_mut().unwrap().buffer = "extra note".to_string();
+        app.commit_prompt();
+        assert!(app
+            .file
+            .text()
+            .contains("#extra note\nDisableFamilyShareLock"));
+
+        // enter edits the selected line
+        app.comment_selection = 1;
+        app.handle_comments(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.prompt.as_mut().unwrap().buffer = "renamed".to_string();
+        app.commit_prompt();
+        assert!(app.file.text().contains("#renamed\nDisableFamilyShareLock"));
+
+        // d removes it again
+        app.handle_comments(KeyEvent::from(KeyCode::Char('d')))
+            .unwrap();
+        assert!(!app.file.text().contains("#renamed"));
+    }
+
+    #[test]
+    fn tab_on_a_key_without_a_comment_starts_typing_one() {
+        let mut app = App::new(ConfigFile::parse_text("/tmp/config.yaml", "SafeMode: no\n"));
+        select(&mut app, "SafeMode");
+        app.open_comments();
+        assert_eq!(app.mode_name(), "comments");
+        assert!(app.prompt.is_some(), "typing starts straight away");
+
+        app.prompt.as_mut().unwrap().buffer = "deck note".to_string();
+        app.commit_prompt();
+        assert_eq!(app.file.text(), "#deck note\nSafeMode: no\n");
+    }
+
+    #[test]
+    fn comments_and_quick_add_need_the_key_in_the_file() {
+        let mut app = App::new(ConfigFile::parse_text("/tmp/config.yaml", "SafeMode: no\n"));
+        app.jump(true); // DisableFamilyShareLock is missing here
+        app.open_comments();
+        assert_eq!(app.mode_name(), "list");
+        assert!(app.status.contains("not in the config file"));
+
+        select(&mut app, "AppIds");
+        app.quick_add();
+        assert!(app.prompt.is_none());
+        assert!(app.status.contains("not in the config file"));
+    }
+
+    #[test]
+    fn tab_in_the_tree_edits_an_inline_comment() {
+        let text = "AppIds:\n  - 440 #Half-Life 2\n";
+        let mut app = App::new(ConfigFile::parse_text("/tmp/config.yaml", text));
+        app.mode = Mode::Tree;
+        app.tree_key = "AppIds".to_string();
+        app.tree_selection = 0;
+        app.edit_trailing_comment();
+        app.prompt.as_mut().unwrap().buffer = "Half-Life".to_string();
+        app.commit_prompt();
+        assert_eq!(app.file.text(), "AppIds:\n  - 440 #Half-Life\n");
+    }
+
+    #[test]
+    fn quick_add_writes_appid_and_name() {
+        let mut app = app();
+        select(&mut app, "DisableFamilyShareLock");
+        app.quick_add();
+        assert!(app.prompt.is_none(), "only AppId lists can quick add");
+        assert!(app.status.contains("AppId lists"));
+
+        select(&mut app, "AppIds");
+        app.quick_add();
+        app.prompt.as_mut().unwrap().buffer = "408490 Hero Siege Soundtrack".to_string();
+        app.commit_prompt();
+        assert!(app
+            .file
+            .text()
+            .contains("  - 408490 #Hero Siege Soundtrack\n"));
+        assert!(app.status.contains("Added 408490"));
+
+        // nonsense is rejected
+        app.quick_add();
+        app.prompt.as_mut().unwrap().buffer = "not-a-number".to_string();
+        app.commit_prompt();
+        assert!(app.status.contains("not an AppId"));
     }
 
     #[test]

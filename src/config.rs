@@ -48,6 +48,16 @@ pub struct Item {
     pub trailing: String,
 }
 
+impl Item {
+    /// Raw scalar text of the entry; empty for nested collections.
+    pub fn scalar(&self) -> &str {
+        match &self.node {
+            Node::Scalar { value, .. } => value,
+            _ => "",
+        }
+    }
+}
+
 /// Where a new entry goes, and how it should be spelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertPoint {
@@ -167,8 +177,18 @@ impl ConfigFile {
         self.dirty = true;
     }
 
-    /// Where an entry added to the collection at `top_line` + `path` would go.
+    /// Where an entry added to the collection at `key` + `path` would go.
     pub fn insert_point(&self, key: &str, path: &[usize]) -> Option<InsertPoint> {
+        self.insert_point_as(key, path, None)
+    }
+
+    /// Like [`insert_point`](Self::insert_point), with a shape to use when the key is not in the schema and its value is empty.
+    pub fn insert_point_as(
+        &self,
+        key: &str,
+        path: &[usize],
+        hint: Option<Shape>,
+    ) -> Option<InsertPoint> {
         let top = self.top_for(key)?;
         let mut node = top.node.clone();
         let mut owner_line = top.line;
@@ -200,7 +220,7 @@ impl ConfigFile {
             }
         }
 
-        let shape = shape?;
+        let shape = shape.or(hint)?;
         let owner_indent = self.line_indent(owner_line);
         match &node {
             Node::Seq { items, .. } | Node::Map { items, .. } => {
@@ -238,9 +258,21 @@ impl ConfigFile {
         path: &[usize],
         key: Option<&str>,
         raw: &str,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
+        self.add_item_as(setting, path, key, raw, None)
+    }
+
+    /// Like [`add_item`](Self::add_item), with a shape hint for keys that are not in the schema (the picker adds to lists the public build does not know, for example).
+    pub fn add_item_as(
+        &mut self,
+        setting: &str,
+        path: &[usize],
+        key: Option<&str>,
+        raw: &str,
+        hint: Option<Shape>,
+    ) -> Result<usize, String> {
         let point = self
-            .insert_point(setting, path)
+            .insert_point_as(setting, path, hint)
             .ok_or("cannot find where to add this entry")?;
         let new_line = match point.shape {
             Shape::Seq => format!("{}- {}", point.indent, raw.trim()),
@@ -256,10 +288,106 @@ impl ConfigFile {
                 }
             }
         };
-        self.lines
-            .insert(point.line.min(self.lines.len()), new_line);
+        let at = point.line.min(self.lines.len());
+        self.lines.insert(at, new_line);
         self.dirty = true;
-        Ok(())
+        Ok(at)
+    }
+
+    /// The comment block directly above `setting`, without the leading `#`.
+    pub fn comment_block(&self, setting: &str) -> Vec<String> {
+        let Some(top) = self.top_for(setting) else {
+            return Vec::new();
+        };
+        let start = self.comment_start(top.line);
+        self.lines[start..top.line]
+            .iter()
+            .map(|line| strip_hash(line))
+            .collect()
+    }
+
+    /// First line of the comment block directly above `line`.
+    fn comment_start(&self, line: usize) -> usize {
+        let mut index = line;
+        while index > 0 && self.lines[index - 1].trim_start().starts_with('#') {
+            index -= 1;
+        }
+        index
+    }
+
+    /// Replace comment line `index` of `setting`; new lines are appended.
+    pub fn set_comment_line(&mut self, setting: &str, index: usize, text: &str) {
+        let Some(top) = self.top_for(setting) else {
+            return;
+        };
+        let start = self.comment_start(top.line);
+        let count = top.line - start;
+        let line = start + index.min(count);
+        self.lines.insert(line, format!("#{text}"));
+        if index < count {
+            self.lines.remove(line + 1);
+        }
+        self.dirty = true;
+    }
+
+    /// Add a comment line at `index` (or at the end of the block).
+    pub fn insert_comment_line(&mut self, setting: &str, index: Option<usize>, text: &str) {
+        let Some(top) = self.top_for(setting) else {
+            return;
+        };
+        let start = self.comment_start(top.line);
+        let count = top.line - start;
+        let at = start + index.unwrap_or(count).min(count);
+        let text = text.trim_end().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.lines.insert(at, format!("#{text}"));
+        self.dirty = true;
+    }
+
+    /// Remove comment line `index` of `setting`.
+    pub fn remove_comment_line(&mut self, setting: &str, index: usize) {
+        let Some(top) = self.top_for(setting) else {
+            return;
+        };
+        let start = self.comment_start(top.line);
+        let count = top.line - start;
+        if index < count {
+            self.lines.remove(start + index);
+            self.dirty = true;
+        }
+    }
+
+    /// Replace the inline comment on `line`, or drop it when `text` is empty.
+    pub fn set_trailing_comment(&mut self, line: usize, text: &str) {
+        let Some(original) = self.lines.get(line).cloned() else {
+            return;
+        };
+        let (prefix, value, _) = split_line(&original);
+        let mut rebuilt = prefix;
+        rebuilt.push_str(&value);
+        let text = text.trim().trim_start_matches('#').trim_end();
+        if !text.is_empty() {
+            rebuilt = format!("{} #{text}", rebuilt.trim_end());
+        }
+        self.lines[line] = rebuilt;
+        self.dirty = true;
+    }
+
+    /// Split a quick add entry into its AppId and optional name comment.
+    pub fn parse_add_entry(input: &str) -> Result<(String, Option<String>), String> {
+        let mut parts = input.trim().splitn(2, char::is_whitespace);
+        let appid = parts.next().unwrap_or("").trim();
+        if !is_int(appid) {
+            return Err(format!("'{appid}' is not an AppId (number)"));
+        }
+        let name = parts
+            .next()
+            .map(|name| name.trim().trim_start_matches('#').trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        Ok((appid.to_string(), name))
     }
 
     /// Delete an entry and everything nested under it.
@@ -295,6 +423,13 @@ impl ConfigFile {
     }
 }
 
+/// Comment text without the leading `#` and at most one space.
+fn strip_hash(line: &str) -> String {
+    let text = line.trim_start();
+    let text = text.strip_prefix('#').unwrap_or(text);
+    text.strip_prefix(' ').unwrap_or(text).to_string()
+}
+
 /// True when `line` is a top level `Key:` line, returning the key.
 fn top_level_key(line: &str) -> Option<&str> {
     if line.starts_with([' ', '\t', '#']) {
@@ -307,20 +442,17 @@ fn top_level_key(line: &str) -> Option<&str> {
     Some(key)
 }
 
-/// Comment lines directly above `line`, without blank lines.
+/// Comment lines directly above `line`. A blank line ends the block, so a comment further up belongs to whatever came before it.
 fn comments_above(lines: &[String], line: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut index = line;
     while index > 0 {
         let previous = lines[index - 1].trim_start();
-        if previous.starts_with('#') {
-            out.push(previous.to_string());
-            index -= 1;
-        } else if previous.is_empty() {
-            index -= 1;
-        } else {
+        if !previous.starts_with('#') {
             break;
         }
+        out.push(previous.to_string());
+        index -= 1;
     }
     out.reverse();
     out
@@ -384,8 +516,7 @@ fn parse_items(lines: &[String], parent_line: usize, parent_depth: usize) -> Vec
             index += 1;
             continue;
         }
-        // Entries sit at one indentation level; deeper lines belong to the
-        // previous entry and are consumed by its recursion.
+        // Entries sit at one indentation level; deeper lines belong to the previous entry and are consumed by its recursion.
         match entry_indent {
             None => entry_indent = Some(indent),
             Some(expected) if indent > expected => {
@@ -905,6 +1036,80 @@ IdleStatus:
         )
         .is_err());
         assert!(check_entry(Shape::MapOfMap, Some(ValueKind::Text), Some("1"), "").is_ok());
+    }
+
+    #[test]
+    fn comments_stop_at_blank_lines() {
+        let text = "# belongs to whatever came before\n\n# direct comment\nKey: yes\n";
+        let file = ConfigFile::parse_text("/tmp/config.yaml", text);
+        assert_eq!(
+            file.comment_block("Key"),
+            vec!["direct comment".to_string()]
+        );
+        let tops = file.parse();
+        let key = tops.iter().find(|top| top.key == "Key").unwrap();
+        assert_eq!(key.comments, vec!["# direct comment".to_string()]);
+    }
+
+    #[test]
+    fn comment_lines_can_be_added_edited_and_removed() {
+        let mut file = ConfigFile::parse_text("/tmp/config.yaml", "#one\n#two\nKey: yes\n");
+        assert_eq!(file.comment_block("Key"), vec!["one", "two"]);
+
+        file.set_comment_line("Key", 0, "changed");
+        assert_eq!(file.comment_block("Key"), vec!["changed", "two"]);
+
+        file.insert_comment_line("Key", None, "three");
+        assert_eq!(file.comment_block("Key"), vec!["changed", "two", "three"]);
+
+        file.remove_comment_line("Key", 1);
+        assert_eq!(file.comment_block("Key"), vec!["changed", "three"]);
+        assert_eq!(file.text(), "#changed\n#three\nKey: yes\n");
+    }
+
+    #[test]
+    fn a_key_without_comments_gets_one() {
+        let mut file = ConfigFile::parse_text("/tmp/config.yaml", "Key: yes\n");
+        file.insert_comment_line("Key", None, "note");
+        assert_eq!(file.text(), "#note\nKey: yes\n");
+
+        // editing the first line of an empty block creates it too
+        let mut file = ConfigFile::parse_text("/tmp/config.yaml", "Key: yes\n");
+        file.set_comment_line("Key", 0, "hello");
+        assert_eq!(file.text(), "#hello\nKey: yes\n");
+        file.set_comment_line("Key", 0, "bye");
+        assert_eq!(file.text(), "#bye\nKey: yes\n");
+    }
+
+    #[test]
+    fn trailing_comments_can_be_set_and_cleared() {
+        let mut file = ConfigFile::parse_text("/tmp/config.yaml", "AppIds:\n  - 440 # old\n");
+        file.set_trailing_comment(1, "Half-Life 2");
+        assert_eq!(file.text(), "AppIds:\n  - 440 #Half-Life 2\n");
+
+        file.set_trailing_comment(1, "");
+        assert_eq!(file.text(), "AppIds:\n  - 440\n");
+
+        file.set_trailing_comment(0, "games");
+        assert_eq!(file.text(), "AppIds: #games\n  - 440\n");
+    }
+
+    #[test]
+    fn quick_add_input_is_parsed() {
+        assert_eq!(
+            ConfigFile::parse_add_entry("440"),
+            Ok(("440".to_string(), None))
+        );
+        assert_eq!(
+            ConfigFile::parse_add_entry("  440  Half-Life 2 "),
+            Ok(("440".to_string(), Some("Half-Life 2".to_string())))
+        );
+        assert_eq!(
+            ConfigFile::parse_add_entry("440 #Half-Life 2"),
+            Ok(("440".to_string(), Some("Half-Life 2".to_string())))
+        );
+        assert!(ConfigFile::parse_add_entry("half-life").is_err());
+        assert!(ConfigFile::parse_add_entry("").is_err());
     }
 
     #[test]
