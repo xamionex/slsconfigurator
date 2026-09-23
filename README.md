@@ -70,6 +70,7 @@ The file has to exist already; start Steam once with SLSsteam installed so it cr
 | `a` / `d` | add / delete an entry, or quick add an AppId to a list |
 | `esc` / `b` | leave a collection or a comment; `esc` steps back through the picker and closes it |
 | `s` | save (SLSsteam reloads it automatically) |
+| `ctrl+c` | quit at once without saving, from anywhere, with no prompt |
 | `q` / `esc` | quit, with a save/discard prompt when there are changes |
 
 ### Steam picker (`g`)

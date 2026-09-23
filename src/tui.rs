@@ -217,6 +217,11 @@ impl App {
             return Ok(false);
         }
 
+        // Ctrl+C leaves at once and discards unsaved edits: no save prompt, no clipboard, whatever is open.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(true);
+        }
+
         if self.confirm_quit {
             self.confirm_quit = false;
             return match key.code {
@@ -1041,7 +1046,7 @@ impl App {
                 "type to search   enter details   space toggle   r remove games   t target   esc close"
             }
             Mode::List => {
-                "up/down select   enter open   tab comment   g steam   a quick add   s save   q quit"
+                "up/down select   enter open   tab comment   g steam   a quick add   s save   q quit   ctrl+c quit without saving"
             }
             Mode::Tree => {
                 "up/down select   enter edit   space toggle   a add   d delete   tab comment   esc back"
@@ -1442,6 +1447,37 @@ LogLevels: 0xff
         app.prompt.as_mut().unwrap().buffer = "Half-Life".to_string();
         app.commit_prompt();
         assert_eq!(app.file.text(), "AppIds:\n  - 440 #Half-Life\n");
+    }
+
+    #[test]
+    fn ctrl_c_quits_without_saving_from_anywhere() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        // In the settings list, with unsaved edits: no save prompt, straight out.
+        let mut list = app();
+        select(&mut list, "DisableFamilyShareLock");
+        list.handle_list(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(list.file.dirty());
+        assert!(list.handle_key(ctrl_c).unwrap());
+        assert!(!list.confirm_quit, "ctrl+c does not ask");
+
+        // While the picker is open and focused.
+        let mut with_picker = app();
+        with_picker.picker.toggle();
+        assert!(with_picker.picker.has_focus());
+        assert!(with_picker.handle_key(ctrl_c).unwrap());
+
+        // While a comment is being typed.
+        let mut typing = app();
+        select(&mut typing, "FakeName");
+        typing.open_comments();
+        assert!(typing.prompt.is_some());
+        assert!(typing.handle_key(ctrl_c).unwrap());
+
+        // And on the quit prompt itself, without answering it.
+        let mut confirming = app();
+        confirming.confirm_quit = true;
+        assert!(confirming.handle_key(ctrl_c).unwrap());
     }
 
     #[test]
