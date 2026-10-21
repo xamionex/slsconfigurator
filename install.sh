@@ -10,7 +10,9 @@ set -eu
 
 REPO="xamionex/slsconfigurator"
 BIN_NAME="slsconfigurator"
-URL="${SLSCONFIGURATOR_URL:-https://github.com/$REPO/releases/latest/download/$BIN_NAME}"
+RELEASE_PAGE="https://github.com/$REPO/releases/latest"
+DOWNLOAD_BASE="https://github.com/$REPO/releases/download"
+VERSION=""
 
 info() { printf '%s\n' "==> $*"; }
 warn() { printf '%s\n' "!! $*" >&2; }
@@ -21,6 +23,9 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 Usage: curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh
 
 Downloads the latest $BIN_NAME release and installs it to ~/.local/bin.
+
+Environment:
+  SLSCONFIGURATOR_URL     override the download URL
 EOF
     exit 0
 elif [ -n "${1:-}" ]; then
@@ -32,7 +37,33 @@ BIN_DIR="$HOME/.local/bin"
 command -v curl >/dev/null 2>&1 || die "curl is required but not installed"
 command -v mktemp >/dev/null 2>&1 || die "mktemp is required but not installed"
 
-info "downloading $BIN_NAME from $URL"
+# The release page redirect ends in the tag, so the version is known before the download.
+resolve_version() {
+    page="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "$RELEASE_PAGE" 2>/dev/null || true)"
+    page="${page%%\?*}"
+    page="${page%/}"
+    tag="${page##*/}"
+    case "$tag" in
+        v[0-9]*) printf '%s\n' "$tag" ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ -n "${SLSCONFIGURATOR_URL:-}" ]; then
+    URL="$SLSCONFIGURATOR_URL"
+    info "using SLSCONFIGURATOR_URL override"
+else
+    VERSION="$(resolve_version || true)"
+    if [ -n "$VERSION" ]; then
+        URL="$DOWNLOAD_BASE/$VERSION/$BIN_NAME"
+        info "latest release is $VERSION"
+    else
+        URL="$RELEASE_PAGE/download/$BIN_NAME"
+        warn "could not determine the latest release version"
+    fi
+fi
+info "downloading $BIN_NAME${VERSION:+ $VERSION} from $URL"
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 curl -fsSL -o "$TMP_DIR/$BIN_NAME" "$URL" \
@@ -42,7 +73,7 @@ curl -fsSL -o "$TMP_DIR/$BIN_NAME" "$URL" \
 head -c 4 "$TMP_DIR/$BIN_NAME" | grep -q "$(printf '\177ELF')" || die "downloaded file is not an ELF binary"
 
 chmod 755 "$TMP_DIR/$BIN_NAME"
-info "installing binary to $BIN_DIR/$BIN_NAME"
+info "installing $BIN_NAME${VERSION:+ $VERSION} to $BIN_DIR/$BIN_NAME"
 mkdir -p "$BIN_DIR"
 install -m 755 "$TMP_DIR/$BIN_NAME" "$BIN_DIR/$BIN_NAME"
 

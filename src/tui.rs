@@ -937,10 +937,11 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let version = env!("CARGO_PKG_VERSION");
         let title = match self.mode {
-            Mode::List => "SLSsteam config",
-            Mode::Tree => "SLSsteam config - editing a collection",
-            Mode::Comments => "SLSsteam config - editing a comment",
+            Mode::List => format!("SLSsteam config v{version}"),
+            Mode::Tree => format!("SLSsteam config v{version} - editing a collection"),
+            Mode::Comments => format!("SLSsteam config v{version} - editing a comment"),
         };
         let modified = if self.file.dirty() { " (modified)" } else { "" };
         let text = Line::from(vec![
@@ -1324,6 +1325,24 @@ LogLevels: 0xff
             .collect();
         assert!(
             text.contains("> DisableFamilyShareLock"),
+            "rendered: {text}"
+        );
+    }
+
+    #[test]
+    fn the_header_shows_the_version() {
+        let mut app = app();
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            text.contains(&format!("SLSsteam config v{}", env!("CARGO_PKG_VERSION"))),
             "rendered: {text}"
         );
     }
