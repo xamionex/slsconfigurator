@@ -257,6 +257,11 @@ pub fn value_kind(key: &str) -> Option<ValueKind> {
     }
 }
 
+/// True when new values of `key` are always written quoted, even if YAML would accept them bare.
+pub fn quotes_text(key: &str) -> bool {
+    matches!(key, "GameTitles")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

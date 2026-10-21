@@ -832,6 +832,8 @@ impl App {
                 }
                 let raw = if matches!(shape, Shape::Seq) || kind == Some(ValueKind::Integer) {
                     text.trim().to_string()
+                } else if schema::quotes_text(&self.tree_key) {
+                    config::quote_always(&text)
                 } else {
                     config::quote(&text)
                 };
@@ -1646,6 +1648,34 @@ LogLevels: 0xff
         app.prompt.as_mut().unwrap().buffer = "hello".to_string();
         app.commit_prompt();
         assert!(app.status.contains("must be a number"));
+    }
+
+    #[test]
+    fn adding_a_game_title_always_quotes_it() {
+        let text = "GameTitles:\n  10: \"Counter-Striker\"  #Counter-Strike\n";
+        let mut app = App::new(ConfigFile::parse_text("/tmp/config.yaml", text));
+        app.mode = Mode::Tree;
+        app.tree_key = "GameTitles".to_string();
+        app.start_add();
+        app.prompt.as_mut().unwrap().buffer = "730".to_string();
+        app.commit_prompt();
+        app.prompt.as_mut().unwrap().buffer = "Portal 2".to_string();
+        app.commit_prompt();
+        assert!(
+            app.file.text().contains("  730: \"Portal 2\"\n"),
+            "{}",
+            app.file.text()
+        );
+
+        // Quotes and backslashes are escaped on write and come back intact.
+        app.start_add();
+        app.prompt.as_mut().unwrap().buffer = "440".to_string();
+        app.commit_prompt();
+        app.prompt.as_mut().unwrap().buffer = "A \"B\" \\ C".to_string();
+        app.commit_prompt();
+        let rows = app.tree_rows();
+        let row = rows.iter().find(|row| row.label == "440").unwrap();
+        assert_eq!(row.value, "A \"B\" \\ C");
     }
 
     #[test]
